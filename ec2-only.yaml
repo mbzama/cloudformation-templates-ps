@@ -38,7 +38,7 @@ Parameters:
       - t3a.micro
       - t3a.small
       - t3a.medium
-    Description: Allowed: t2/t3/t3a micro|small|medium only.
+    Description: 'Allowed: t2/t3/t3a micro|small|medium only.'
 
   VolumeSize:
     Type: Number

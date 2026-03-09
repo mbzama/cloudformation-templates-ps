@@ -25,7 +25,6 @@ Metadata:
         Parameters:
           - DBInstanceClass
           - DBUsername
-          - DBPassword
           - DBName
     ParameterLabels:
       KeyPairName:
@@ -36,8 +35,6 @@ Metadata:
         default: RDS Instance Class
       DBUsername:
         default: RDS Master Username
-      DBPassword:
-        default: RDS Master Password
       DBName:
         default: Initial Database Name
 
@@ -59,7 +56,7 @@ Parameters:
       - t3a.micro
       - t3a.small
       - t3a.medium
-    Description: EC2 instance type. Allowed: t2/t3/t3a micro|small|medium only.
+    Description: 'EC2 instance type. Allowed: t2/t3/t3a micro|small|medium only.'
 
   DBInstanceClass:
     Type: String
@@ -71,7 +68,7 @@ Parameters:
       - db.t4g.micro
       - db.t4g.small
       - db.t4g.medium
-    Description: RDS instance class. Allowed: db.t3/t4g micro|small|medium only.
+    Description: 'RDS instance class. Allowed: db.t3/t4g micro|small|medium only.'
 
   DBName:
     Type: String
@@ -89,15 +86,19 @@ Parameters:
     AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
     Description: RDS master username.
 
-  DBPassword:
-    Type: String
-    NoEcho: true
-    MinLength: 8
-    MaxLength: 41
-    AllowedPattern: '[a-zA-Z0-9!#$%^&*()_+=-]*'
-    Description: RDS master password (8-41 chars, alphanumeric + special chars).
-
 Resources:
+
+  # ---------------------------------------------------------------
+  # Secrets Manager - Auto-generated RDS Master Password
+  # ---------------------------------------------------------------
+
+  RDSMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'MySQL master password for ${AWS::StackName}'
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\%'
 
   # ---------------------------------------------------------------
   # Default VPC Lookup (Lambda Custom Resource)
@@ -298,9 +299,9 @@ Resources:
       DBInstanceIdentifier: !Sub 'mysql-${DefaultVpcLookup.Suffix}'
       DBInstanceClass: !Ref DBInstanceClass
       Engine: mysql
-      EngineVersion: '8.0'
+      EngineVersion: '8.0.35'
       MasterUsername: !Ref DBUsername
-      MasterUserPassword: !Ref DBPassword
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${RDSMasterSecret}:SecretString:}}'
       DBName: !Ref DBName
       AllocatedStorage: '20'
       MaxAllocatedStorage: 50
@@ -410,5 +411,17 @@ Outputs:
     Value: !Sub 'ssh -i <your-key>.pem ec2-user@${EC2Instance.PublicIp}'
 
   MySQLConnectCommand:
-    Description: MySQL connect command (run from EC2)
-    Value: !Sub 'mysql -h ${RDSInstance.Endpoint.Address} -u ${DBUsername} -p ${DBName}'
+    Description: MySQL connect command (run from EC2; password in Secrets Manager)
+    Value: !Sub 'mysql -h ${RDSInstance.Endpoint.Address} -u ${DBUsername} ${DBName}'
+
+  RDSMasterSecretArn:
+    Description: ARN of the Secrets Manager secret containing the master password
+    Value: !Ref RDSMasterSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-rds-secret-arn'
+
+  RDSMasterSecretName:
+    Description: Name of the Secrets Manager secret
+    Value: !Ref RDSMasterSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-rds-secret-name'

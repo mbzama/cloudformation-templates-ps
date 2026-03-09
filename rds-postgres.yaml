@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   RDS PostgreSQL only.
 
-  Deploy in us-east-1 or us-west-2 only.
+  Deploy in us-east-1 only.
+  Default VPC and subnets (us-east-1a, us-east-1b) are auto-detected at deploy time.
 
 # ---------------------------------------------------------------
 # Sandbox Limits:
@@ -13,46 +14,26 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
-          default: Network
-        Parameters:
-          - VpcId
-          - SubnetIds
-      - Label:
           default: RDS PostgreSQL
         Parameters:
           - DBInstanceClass
           - DBName
           - DBUsername
-          - DBPassword
           - AllocatedStorage
           - PostgresVersion
     ParameterLabels:
-      VpcId:
-        default: Default VPC ID
-      SubnetIds:
-        default: Subnets (select at least 2 from your default VPC)
       DBInstanceClass:
         default: RDS Instance Class
       DBName:
         default: Initial Database Name
       DBUsername:
         default: Master Username
-      DBPassword:
-        default: Master Password
       AllocatedStorage:
         default: Storage Size (GB)
       PostgresVersion:
         default: PostgreSQL Version
 
 Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: Select your default VPC.
-
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: Select at least 2 subnets in different AZs from your default VPC.
-
   DBInstanceClass:
     Type: String
     Default: db.t3.micro
@@ -64,7 +45,7 @@ Parameters:
       - db.t4g.micro
       - db.t4g.small
       - db.t4g.medium
-    Description: Allowed: db.t3/t4g micro|small|medium only.
+    Description: 'Allowed: db.t3/t4g micro|small|medium only.'
 
   PostgresVersion:
     Type: String
@@ -92,13 +73,6 @@ Parameters:
     AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]*'
     Description: Master username (cannot be "postgres").
 
-  DBPassword:
-    Type: String
-    NoEcho: true
-    MinLength: 8
-    MaxLength: 128
-    Description: Master password (min 8 chars).
-
   AllocatedStorage:
     Type: Number
     Default: 20
@@ -108,11 +82,104 @@ Parameters:
 
 Resources:
 
+  # ---------------------------------------------------------------
+  # Secrets Manager - Auto-generated Master Password
+  # ---------------------------------------------------------------
+
+  RDSMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'PostgreSQL master password for ${AWS::StackName}'
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\%'
+
+  # ---------------------------------------------------------------
+  # Default VPC Lookup (Lambda Custom Resource)
+  # Auto-detects default VPC and subnets in us-east-1a, us-east-1b
+  # ---------------------------------------------------------------
+
+  DefaultVpcLookupPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allows Lambda to describe VPCs and subnets for default VPC lookup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeVpcs
+              - ec2:DescribeSubnets
+            Resource: '*'
+
+  DefaultVpcLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref DefaultVpcLookupPolicy
+
+  DefaultVpcLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-vpc-lookup'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DefaultVpcLookupRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  ec2 = boto3.client('ec2')
+                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                  vpc_id = vpcs['Vpcs'][0]['VpcId']
+                  subnets = ec2.describe_subnets(Filters=[
+                      {'Name': 'vpc-id', 'Values': [vpc_id]},
+                      {'Name': 'defaultForAz', 'Values': ['true']}
+                  ])
+                  allowed_azs = {'us-east-1a', 'us-east-1b'}
+                  subnet_list = sorted(
+                      [s for s in subnets['Subnets'] if s['AvailabilityZone'] in allowed_azs],
+                      key=lambda s: s['AvailabilityZone']
+                  )
+                  if not subnet_list:
+                      raise ValueError('No default subnets found in us-east-1a or us-east-1b')
+                  subnet_ids = [s['SubnetId'] for s in subnet_list]
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'VpcId': vpc_id,
+                      'SubnetIds': ','.join(subnet_ids)
+                  })
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  DefaultVpcLookup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DefaultVpcLookupFunction.Arn
+
+  # ---------------------------------------------------------------
+  # RDS Security Group & Database
+  # ---------------------------------------------------------------
+
   RDSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: RDS PostgreSQL - allow port 5432 inbound
-      VpcId: !Ref VpcId
+      VpcId: !GetAtt DefaultVpcLookup.VpcId
       SecurityGroupIngress:
         - Description: PostgreSQL from anywhere in the VPC
           IpProtocol: tcp
@@ -127,7 +194,7 @@ Resources:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
       DBSubnetGroupDescription: !Sub 'Subnet group for ${AWS::StackName} PostgreSQL RDS'
-      SubnetIds: !Ref SubnetIds
+      SubnetIds: !Split [',', !GetAtt DefaultVpcLookup.SubnetIds]
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-subnet-group'
@@ -142,7 +209,7 @@ Resources:
       Engine: postgres
       EngineVersion: !Ref PostgresVersion
       MasterUsername: !Ref DBUsername
-      MasterUserPassword: !Ref DBPassword
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${RDSMasterSecret}:SecretString:}}'
       DBName: !Ref DBName
       AllocatedStorage: !Ref AllocatedStorage
       MaxAllocatedStorage: 50         # Auto-scaling cap = 50 GB
@@ -160,6 +227,13 @@ Resources:
           Value: !Sub '${AWS::StackName}-postgres'
 
 Outputs:
+
+  DefaultVpcId:
+    Description: Auto-detected default VPC ID
+    Value: !GetAtt DefaultVpcLookup.VpcId
+    Export:
+      Name: !Sub '${AWS::StackName}-vpc-id'
+
   RDSEndpoint:
     Description: PostgreSQL endpoint hostname
     Value: !GetAtt RDSPostgresInstance.Endpoint.Address
@@ -172,9 +246,21 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-port'
 
+  RDSMasterSecretArn:
+    Description: ARN of the Secrets Manager secret containing the master password
+    Value: !Ref RDSMasterSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-secret-arn'
+
+  RDSMasterSecretName:
+    Description: Name of the Secrets Manager secret
+    Value: !Ref RDSMasterSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-secret-name'
+
   PSQLConnectCommand:
-    Description: psql connection command
-    Value: !Sub 'psql -h ${RDSPostgresInstance.Endpoint.Address} -U ${DBUsername} -d ${DBName} -p 5432'
+    Description: psql connection command (password stored in Secrets Manager)
+    Value: !Sub 'psql -h ${RDSPostgresInstance.Endpoint.Address} -U ${DBUsername} -d ${DBName}'
 
   JDBCConnectionString:
     Description: JDBC connection string (Java / Spring Boot)

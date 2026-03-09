@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   EC2, RDS (PostgreSQL), and ALB using Default VPC.
 
-  Deploy in us-east-1 or us-west-2 only.
+  Deploy in us-east-1 only.
   Default VPC and subnets are auto-detected at deploy time.
 
 # ---------------------------------------------------------------
@@ -16,35 +16,39 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
+          default: Naming
+        Parameters:
+          - ResourcePrefix
+      - Label:
           default: EC2
         Parameters:
-          - KeyPairName
           - EC2InstanceType
       - Label:
           default: RDS
         Parameters:
           - DBInstanceClass
           - DBUsername
-          - DBPassword
           - DBName
     ParameterLabels:
-      KeyPairName:
-        default: EC2 Key Pair (for SSH)
+      ResourcePrefix:
+        default: Resource Prefix
       EC2InstanceType:
         default: EC2 Instance Type
       DBInstanceClass:
         default: RDS Instance Class
       DBUsername:
         default: RDS Master Username
-      DBPassword:
-        default: RDS Master Password
       DBName:
         default: Initial Database Name
 
 Parameters:
-  KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 Key Pair for SSH access (must already exist in your account).
+  ResourcePrefix:
+    Type: String
+    Default: app
+    MinLength: 1
+    MaxLength: 10
+    AllowedPattern: '[a-z][a-z0-9]*'
+    Description: 'Short alphanumeric prefix for resource names (1-10 chars, lowercase). Used to keep ALB/TG names within AWS 32-character limit.'
 
   EC2InstanceType:
     Type: String
@@ -59,7 +63,7 @@ Parameters:
       - t3a.micro
       - t3a.small
       - t3a.medium
-    Description: EC2 instance type. Allowed: t2/t3/t3a micro|small|medium only.
+    Description: 'EC2 instance type. Allowed: t2/t3/t3a micro|small|medium only.'
 
   DBInstanceClass:
     Type: String
@@ -71,7 +75,7 @@ Parameters:
       - db.t4g.micro
       - db.t4g.small
       - db.t4g.medium
-    Description: RDS instance class. Allowed: db.t3/t4g micro|small|medium only.
+    Description: 'RDS instance class. Allowed: db.t3/t4g micro|small|medium only.'
 
   DBName:
     Type: String
@@ -89,15 +93,22 @@ Parameters:
     AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
     Description: RDS master username (cannot be "postgres" - reserved by AWS).
 
-  DBPassword:
-    Type: String
-    NoEcho: true
-    MinLength: 8
-    MaxLength: 41
-    AllowedPattern: '[a-zA-Z0-9!#$%^&*()_+=-]*'
-    Description: RDS master password (8-41 chars, alphanumeric + special chars).
-
 Resources:
+
+  # ---------------------------------------------------------------
+  # Secrets Manager - RDS Password
+  # ---------------------------------------------------------------
+
+  RDSMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-rds-password'
+      Description: !Sub 'RDS master password for ${AWS::StackName}'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
 
   # ---------------------------------------------------------------
   # Default VPC Lookup (Lambda Custom Resource)
@@ -196,7 +207,7 @@ Resources:
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: EC2 - allow HTTP from ALB and SSH from internet
+      GroupDescription: 'EC2 - allow HTTP from ALB and EC2 Instance Connect'
       VpcId: !GetAtt DefaultVpcLookup.VpcId
       SecurityGroupIngress:
         - Description: HTTP from ALB only
@@ -204,7 +215,7 @@ Resources:
           FromPort: 80
           ToPort: 80
           SourceSecurityGroupId: !Ref ALBSecurityGroup
-        - Description: SSH from internet (restrict to your IP in production)
+        - Description: 'EC2 Instance Connect (AWS console access)'
           IpProtocol: tcp
           FromPort: 22
           ToPort: 22
@@ -229,6 +240,30 @@ Resources:
           Value: !Sub '${AWS::StackName}-rds-sg'
 
   # ---------------------------------------------------------------
+  # IAM Role for EC2 Instance Connect
+  # ---------------------------------------------------------------
+
+  EC2InstanceConnectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/EC2InstanceConnect
+      Description: Allows EC2 Instance Connect access via AWS Console
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceConnectRole
+
+  # ---------------------------------------------------------------
   # EC2 Instance
   # ---------------------------------------------------------------
 
@@ -237,7 +272,7 @@ Resources:
     Properties:
       InstanceType: !Ref EC2InstanceType
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
-      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
       Tenancy: default
       SecurityGroupIds:
         - !Ref EC2SecurityGroup
@@ -300,7 +335,7 @@ Resources:
       Engine: postgres
       EngineVersion: '16.3'
       MasterUsername: !Ref DBUsername
-      MasterUserPassword: !Ref DBPassword
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${RDSMasterSecret}:SecretString:password}}'
       DBName: !Ref DBName
       AllocatedStorage: '20'
       MaxAllocatedStorage: 50
@@ -324,7 +359,7 @@ Resources:
   ALBTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub '${AWS::StackName}-tg'
+      Name: !Sub '${ResourcePrefix}-tg-${DefaultVpcLookup.Suffix}'
       Port: 80
       Protocol: HTTP
       VpcId: !GetAtt DefaultVpcLookup.VpcId
@@ -345,7 +380,7 @@ Resources:
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub '${AWS::StackName}-alb'
+      Name: !Sub '${ResourcePrefix}-alb-${DefaultVpcLookup.Suffix}'
       Scheme: internet-facing
       Type: application
       Subnets: !Split [',', !GetAtt DefaultVpcLookup.SubnetIds]
@@ -406,9 +441,25 @@ Outputs:
       Name: !Sub '${AWS::StackName}-rds-port'
 
   SSHCommand:
-    Description: SSH command to connect to EC2
-    Value: !Sub 'ssh -i <your-key>.pem ec2-user@${EC2Instance.PublicIp}'
+    Description: 'How to connect to EC2 using EC2 Instance Connect'
+    Value: !Sub 'Use AWS Systems Manager Session Manager or AWS Console EC2 Connect feature for instance ID ${EC2Instance.InstanceId}. No SSH key needed.'
+    Export:
+      Name: !Sub '${AWS::StackName}-connect-info'
 
   PostgreSQLConnectCommand:
     Description: PostgreSQL connect command (run from EC2)
     Value: !Sub 'psql -h ${RDSInstance.Endpoint.Address} -U ${DBUsername} -d ${DBName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-psql-command'
+
+  RDSSecretArn:
+    Description: Secrets Manager ARN for RDS master credentials
+    Value: !Ref RDSMasterSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-rds-secret-arn'
+
+  RDSSecretName:
+    Description: Secrets Manager secret name for RDS master credentials
+    Value: !Sub '${AWS::StackName}-rds-password'
+    Export:
+      Name: !Sub '${AWS::StackName}-rds-secret-name'

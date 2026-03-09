@@ -19,29 +19,23 @@ Metadata:
         Parameters:
           - NodeType
           - DBUsername
-          - DBPassword
           - DBName
       - Label:
           default: PostgreSQL RDS
         Parameters:
           - PGDBName
           - PGUsername
-          - PGPassword
     ParameterLabels:
       NodeType:
         default: Redshift Node Type
       DBUsername:
         default: Redshift Master Username
-      DBPassword:
-        default: Redshift Master Password
       DBName:
         default: Redshift Database Name
       PGDBName:
         default: PostgreSQL Database Name
       PGUsername:
         default: PostgreSQL Master Username
-      PGPassword:
-        default: PostgreSQL Master Password
 
 Parameters:
   NodeType:
@@ -69,16 +63,6 @@ Parameters:
       Master username (lowercase only). Cannot be "admin", "user",
       "root", "postgres", or other reserved words.
 
-  DBPassword:
-    Type: String
-    NoEcho: true
-    MinLength: 8
-    MaxLength: 64
-    AllowedPattern: '[a-zA-Z0-9!#$%^&*()_+=-]*'
-    Description: >
-      Redshift master password (8-64 chars). Must contain at least one uppercase letter,
-      one lowercase letter, and one number.
-
   PGDBName:
     Type: String
     Default: pgpracticedb
@@ -94,14 +78,6 @@ Parameters:
     MaxLength: 16
     AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
     Description: PostgreSQL master username (cannot be "postgres" - reserved by AWS).
-
-  PGPassword:
-    Type: String
-    NoEcho: true
-    MinLength: 8
-    MaxLength: 41
-    AllowedPattern: '[a-zA-Z0-9!#$%^&*()_+=-]*'
-    Description: PostgreSQL master password (8-41 chars, alphanumeric + special chars).
 
 Resources:
 
@@ -191,14 +167,18 @@ Resources:
     Properties:
       Name: !Sub '${AWS::StackName}-redshift-master'
       Description: Redshift cluster master credentials
-      SecretString: !Sub '{"username":"${DBUsername}","password":"${DBPassword}"}'
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\%'
 
   PostgreSQLMasterSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub '${AWS::StackName}-postgres-master'
       Description: PostgreSQL RDS master credentials
-      SecretString: !Sub '{"username":"${PGUsername}","password":"${PGPassword}"}'
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\%'
 
   # ---------------------------------------------------------------
   # Security Groups
@@ -262,8 +242,8 @@ Resources:
       NodeType: !Ref NodeType           # ra3.large
       AvailabilityZone: us-east-1a
       DBName: !Ref DBName
-      MasterUsername: !Sub '{{resolve:secretsmanager:${AWS::StackName}-redshift-master:SecretString:username}}'
-      MasterUserPassword: !Sub '{{resolve:secretsmanager:${AWS::StackName}-redshift-master:SecretString:password}}'
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${RedshiftMasterSecret}:SecretString:}}'
       VpcSecurityGroupIds:
         - !Ref RedshiftSecurityGroup
       ClusterSubnetGroupName: !Ref RedshiftSubnetGroup
@@ -299,8 +279,8 @@ Resources:
       DBInstanceClass: db.t3.medium
       Engine: postgres
       EngineVersion: '17.2'
-      MasterUsername: !Sub '{{resolve:secretsmanager:${AWS::StackName}-postgres-master:SecretString:username}}'
-      MasterUserPassword: !Sub '{{resolve:secretsmanager:${AWS::StackName}-postgres-master:SecretString:password}}'
+      MasterUsername: !Ref PGUsername
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${PostgreSQLMasterSecret}:SecretString:}}'
       DBName: !Ref PGDBName
       AllocatedStorage: '20'
       MaxAllocatedStorage: 50
