@@ -3,19 +3,12 @@ Description: >
   EKS Cluster with dedicated VPC, subnets, NAT gateways, IAM roles, and security group.
   Mirrors eks-cluster.tf and vpc.tf configuration.
 
-  Deploy in us-east-1 or us-west-2 only.
+  Deploy in us-east-1
 
 # ---------------------------------------------------------------
-# Terraform source: eks-cluster.tf
-#   - EKS Cluster IAM Role (AmazonEKSClusterPolicy + AmazonEKSVPCResourceController)
-#   - Cluster Security Group (all egress open)
-#   - EKS Cluster (private + public endpoint, no self-managed addon bootstrap)
-# Terraform source: eks-node-group.tf
-#   - Node group IAM Role (AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, AmazonEC2ContainerRegistryReadOnly)
-#   - Managed node group (private subnets)
-# Terraform source: eks-addons.tf
-#   - Addons: vpc-cni, coredns, kube-proxy
-#   - Tags: Name, Environment, Application=HRMS
+# Sandbox Limits:
+#   - EKS Cluster: 1 cluster with 1 managed node group
+#   - Node Group: t2/t3/t3a micro|small|medium only, max 10 nodes, max 30 GB disk  
 # ---------------------------------------------------------------
 
 Metadata:
@@ -116,30 +109,30 @@ Parameters:
 
   NodeDesiredSize:
     Type: Number
-    Default: 1
+    Default: 2
     MinValue: 1
-    MaxValue: 10
+    MaxValue: 2
     Description: Desired number of worker nodes (maps to var.node_desired_size).
 
   NodeMinSize:
     Type: Number
-    Default: 1
+    Default: 2
     MinValue: 1
-    MaxValue: 10
+    MaxValue: 2
     Description: Minimum number of worker nodes (maps to var.node_min_size).
 
   NodeMaxSize:
     Type: Number
-    Default: 1
+    Default: 2
     MinValue: 1
-    MaxValue: 10
+    MaxValue: 2
     Description: Maximum number of worker nodes (maps to var.node_max_size).
 
   NodeDiskSize:
     Type: Number
     Default: 20
     MinValue: 20
-    MaxValue: 100
+    MaxValue: 30
     Description: Disk size for worker nodes in GB (maps to var.node_disk_size).
 
 Resources:
