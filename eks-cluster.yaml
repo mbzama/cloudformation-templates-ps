@@ -1,16 +1,20 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  EKS Cluster with IAM roles and security group using Default VPC.
-  Mirrors eks-cluster.tf configuration.
+  EKS Cluster with dedicated VPC, subnets, NAT gateways, IAM roles, and security group.
+  Mirrors eks-cluster.tf and vpc.tf configuration.
 
   Deploy in us-east-1 or us-west-2 only.
-  Default VPC and subnets are auto-detected at deploy time.
 
 # ---------------------------------------------------------------
 # Terraform source: eks-cluster.tf
 #   - EKS Cluster IAM Role (AmazonEKSClusterPolicy + AmazonEKSVPCResourceController)
 #   - Cluster Security Group (all egress open)
 #   - EKS Cluster (private + public endpoint, no self-managed addon bootstrap)
+# Terraform source: eks-node-group.tf
+#   - Node group IAM Role (AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, AmazonEC2ContainerRegistryReadOnly)
+#   - Managed node group (private subnets)
+# Terraform source: eks-addons.tf
+#   - Addons: vpc-cni, coredns, kube-proxy
 #   - Tags: Name, Environment, Application=HRMS
 # ---------------------------------------------------------------
 
@@ -18,23 +22,56 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
+          default: Network
+        Parameters:
+          - VpcCidr
+      - Label:
           default: EKS Cluster
         Parameters:
           - ClusterName
           - ClusterVersion
           - Environment
+      - Label:
+          default: EKS Node Group
+        Parameters:
+          - NodeGroupName
+          - NodeInstanceType
+          - NodeDesiredSize
+          - NodeMinSize
+          - NodeMaxSize
+          - NodeDiskSize
     ParameterLabels:
+      VpcCidr:
+        default: VPC CIDR
       ClusterName:
         default: Cluster Name
       ClusterVersion:
         default: Kubernetes Version
       Environment:
         default: Environment Tag
+      NodeGroupName:
+        default: Node Group Name
+      NodeInstanceType:
+        default: Node Instance Type
+      NodeDesiredSize:
+        default: Desired Nodes
+      NodeMinSize:
+        default: Min Nodes
+      NodeMaxSize:
+        default: Max Nodes
+      NodeDiskSize:
+        default: Node Disk Size (GB)
 
 Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}\/\d{1,2}'
+    Description: VPC CIDR block (maps to var.vpc_cidr).
+
   ClusterName:
     Type: String
-    Default: my-eks-cluster
+    Default: hrms-cluster
     MinLength: 1
     MaxLength: 100
     AllowedPattern: '[a-zA-Z][a-zA-Z0-9\-]*'
@@ -51,87 +88,281 @@ Parameters:
 
   Environment:
     Type: String
-    Default: dev
-    AllowedValues:
-      - dev
-      - staging
-      - prod
+    Default: learning
     Description: Environment tag value (maps to var.environment).
 
+  NodeGroupName:
+    Type: String
+    Default: hrms-ng-2
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9\-]*'
+    Description: EKS managed node group name (maps to var.node_group_name).
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3a.micro
+      - t3a.small
+      - t3a.medium
+    Description: EC2 instance type for worker nodes (maps to var.node_instance_type).
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of worker nodes (maps to var.node_desired_size).
+
+  NodeMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum number of worker nodes (maps to var.node_min_size).
+
+  NodeMaxSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of worker nodes (maps to var.node_max_size).
+
+  NodeDiskSize:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+    Description: Disk size for worker nodes in GB (maps to var.node_disk_size).
+
 Resources:
-
   # ---------------------------------------------------------------
-  # Default VPC Lookup (Lambda Custom Resource)
-  # Queries AWS at deploy time for the default VPC and its subnets.
+  # VPC, Subnets, and Routing (matches vpc.tf)
   # ---------------------------------------------------------------
 
-  DefaultVpcLookupPolicy:
-    Type: AWS::IAM::ManagedPolicy
+  VPC:
+    Type: AWS::EC2::VPC
     Properties:
-      Description: Allows Lambda to describe VPCs and subnets for default VPC lookup
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Action:
-              - ec2:DescribeVpcs
-              - ec2:DescribeSubnets
-            Resource: '*'
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+        - Key: Environment
+          Value: !Ref Environment
 
-  DefaultVpcLookupRole:
-    Type: AWS::IAM::Role
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
     Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-        - !Ref DefaultVpcLookupPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
 
-  DefaultVpcLookupFunction:
-    Type: AWS::Lambda::Function
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
     Properties:
-      FunctionName: !Sub '${AWS::StackName}-vpc-lookup'
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt DefaultVpcLookupRole.Arn
-      Timeout: 30
-      Code:
-        ZipFile: |
-          import boto3
-          import cfnresponse
-          import hashlib
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
 
-          def handler(event, context):
-              if event['RequestType'] == 'Delete':
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                  return
-              try:
-                  suffix = hashlib.md5(event['StackId'].encode()).hexdigest()[:8]
-                  ec2 = boto3.client('ec2')
-                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
-                  vpc_id = vpcs['Vpcs'][0]['VpcId']
-                  subnets = ec2.describe_subnets(Filters=[
-                      {'Name': 'vpc-id', 'Values': [vpc_id]},
-                      {'Name': 'defaultForAz', 'Values': ['true']}
-                  ])
-                  subnet_ids = sorted([s['SubnetId'] for s in subnets['Subnets']])
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
-                      'VpcId': vpc_id,
-                      'SubnetIds': ','.join(subnet_ids),
-                      'Suffix': suffix
-                  })
-              except Exception as e:
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
-
-  DefaultVpcLookup:
-    Type: AWS::CloudFormation::CustomResource
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
     Properties:
-      ServiceToken: !GetAtt DefaultVpcLookupFunction.Arn
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-2'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-2'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatEip1:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatEip2:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEip1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-rt-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-rt-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
 
   # ---------------------------------------------------------------
   # EKS Cluster IAM Role
@@ -168,7 +399,7 @@ Resources:
     Properties:
       GroupName: !Sub '${ClusterName}-cluster-sg'
       GroupDescription: Security group for EKS cluster
-      VpcId: !GetAtt DefaultVpcLookup.VpcId
+      VpcId: !Ref VPC
       SecurityGroupEgress:
         - Description: Allow all outbound traffic
           IpProtocol: '-1'
@@ -178,6 +409,32 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${ClusterName}-cluster-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------
+  # EKS Node Group IAM Role
+  # Terraform: aws_iam_role.eks_node_group
+  # ---------------------------------------------------------------
+
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-node-group-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-group-role'
         - Key: Environment
           Value: !Ref Environment
 
@@ -198,7 +455,11 @@ Resources:
       Version: !Ref ClusterVersion
       BootstrapSelfManagedAddons: false
       ResourcesVpcConfig:
-        SubnetIds: !Split [',', !GetAtt DefaultVpcLookup.SubnetIds]
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
         SecurityGroupIds:
           - !Ref EKSClusterSecurityGroup
         EndpointPrivateAccess: true
@@ -211,11 +472,97 @@ Resources:
         - Key: Application
           Value: HRMS
 
+  # ---------------------------------------------------------------
+  # EKS Managed Node Group
+  # Terraform: aws_eks_node_group.main
+  # ---------------------------------------------------------------
+
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: !Ref NodeGroupName
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      ScalingConfig:
+        DesiredSize: !Ref NodeDesiredSize
+        MinSize: !Ref NodeMinSize
+        MaxSize: !Ref NodeMaxSize
+      DiskSize: !Ref NodeDiskSize
+      Labels:
+        environment: !Ref Environment
+        application: hrms
+      Tags:
+        Name: !Ref NodeGroupName
+        Environment: !Ref Environment
+        Application: HRMS
+
+  # ---------------------------------------------------------------
+  # EKS Addons
+  # Terraform: aws_eks_addon.*
+  # ---------------------------------------------------------------
+
+  EKSAddonVpcCni:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: vpc-cni
+      Tags:
+        - Key: Name
+          Value: vpc-cni
+        - Key: Environment
+          Value: !Ref Environment
+
+  EKSAddonCoreDNS:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSNodeGroup
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: coredns
+      Tags:
+        - Key: Name
+          Value: coredns
+        - Key: Environment
+          Value: !Ref Environment
+
+  EKSAddonKubeProxy:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: kube-proxy
+      Tags:
+        - Key: Name
+          Value: kube-proxy
+        - Key: Environment
+          Value: !Ref Environment
+
 # ---------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------
 
 Outputs:
+
+  VpcId:
+    Description: VPC ID created for the EKS cluster
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-vpc-id'
+
+  PublicSubnetIds:
+    Description: Public subnet IDs
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-public-subnets'
+
+  PrivateSubnetIds:
+    Description: Private subnet IDs
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-private-subnets'
 
   ClusterName:
     Description: EKS cluster name
@@ -244,6 +591,18 @@ Outputs:
     Value: !GetAtt EKSClusterRole.Arn
     Export:
       Name: !Sub '${AWS::StackName}-cluster-role-arn'
+
+  NodeGroupName:
+    Description: EKS managed node group name
+    Value: !Ref EKSNodeGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-nodegroup-name'
+
+  NodeGroupArn:
+    Description: EKS managed node group ARN
+    Value: !GetAtt EKSNodeGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-nodegroup-arn'
 
   KubeconfigCommand:
     Description: AWS CLI command to update kubeconfig
