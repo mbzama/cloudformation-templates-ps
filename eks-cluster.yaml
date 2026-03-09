@@ -2,6 +2,8 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   EKS Cluster with IAM roles and security group using Default VPC.
   Mirrors eks-cluster.tf configuration.
+
+  Deploy in us-east-1 or us-west-2 only.
   Default VPC and subnets are auto-detected at deploy time.
 
 # ---------------------------------------------------------------

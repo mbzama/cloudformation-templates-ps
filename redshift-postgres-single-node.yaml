@@ -149,7 +149,6 @@ Resources:
         ZipFile: |
           import boto3
           import cfnresponse
-
           import hashlib
 
           def handler(event, context):

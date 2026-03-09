@@ -59,7 +59,7 @@ Parameters:
       - t3a.micro
       - t3a.small
       - t3a.medium
-    Description: EC2 instance type. Allowed: t2/t3/t3a/t4g micro|small|medium only.
+    Description: EC2 instance type. Allowed: t2/t3/t3a micro|small|medium only.
 
   DBInstanceClass:
     Type: String
@@ -143,7 +143,6 @@ Resources:
         ZipFile: |
           import boto3
           import cfnresponse
-
           import hashlib
 
           def handler(event, context):

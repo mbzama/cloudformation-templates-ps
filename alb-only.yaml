@@ -2,6 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Application Load Balancer only.
   Includes ALB, Target Group, HTTP Listener, and optional HTTPS Listener.
+
   Deploy in us-east-1 or us-west-2 only.
 
 # ---------------------------------------------------------------
