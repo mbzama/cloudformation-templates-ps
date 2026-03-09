@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  RDS PostgreSQL only.
+  Deploy in us-east-1 or us-west-2 only.
+
+# ---------------------------------------------------------------
+# Sandbox Limits:
+#   RDS: t3/t4g micro|small|medium | max 50 GB | no provisioned IOPS
+# ---------------------------------------------------------------
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - SubnetIds
+      - Label:
+          default: RDS PostgreSQL
+        Parameters:
+          - DBInstanceClass
+          - DBName
+          - DBUsername
+          - DBPassword
+          - AllocatedStorage
+          - PostgresVersion
+    ParameterLabels:
+      VpcId:
+        default: Default VPC ID
+      SubnetIds:
+        default: Subnets (select at least 2 from your default VPC)
+      DBInstanceClass:
+        default: RDS Instance Class
+      DBName:
+        default: Initial Database Name
+      DBUsername:
+        default: Master Username
+      DBPassword:
+        default: Master Password
+      AllocatedStorage:
+        default: Storage Size (GB)
+      PostgresVersion:
+        default: PostgreSQL Version
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select your default VPC.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select at least 2 subnets in different AZs from your default VPC.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    # Allowed:: t3 or t4g micro, small, medium
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t4g.micro
+      - db.t4g.small
+      - db.t4g.medium
+    Description: Allowed: db.t3/t4g micro|small|medium only.
+
+  PostgresVersion:
+    Type: String
+    Default: '16.3'
+    AllowedValues:
+      - '16.3'
+      - '15.7'
+      - '14.12'
+      - '13.15'
+    Description: PostgreSQL engine version.
+
+  DBName:
+    Type: String
+    Default: practicedb
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]*'
+    Description: Name of the initial PostgreSQL database.
+
+  DBUsername:
+    Type: String
+    Default: pgadmin
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]*'
+    Description: Master username (cannot be "postgres").
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    Description: Master password (min 8 chars).
+
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 50                      # max 50 GB
+    Description: Storage in GB (20–50 GB).
+
+Resources:
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - allow port 5432 inbound
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: PostgreSQL from anywhere in the VPC
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0          # Restrict to your EC2 SG or IP in production
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rds-sg'
+
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'Subnet group for ${AWS::StackName} PostgreSQL RDS'
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-subnet-group'
+
+  RDSPostgresInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-postgres'
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: !Ref PostgresVersion
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      AllocatedStorage: !Ref AllocatedStorage
+      MaxAllocatedStorage: 50         # Auto-scaling cap = 50 GB
+      StorageType: gp3                # gp3 — NO provisioned IOPS
+      StorageEncrypted: false
+      MultiAZ: false                  # Single-AZ for sandbox
+      PubliclyAccessible: true        # Set true so you can connect from local tools (pgAdmin etc.)
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      BackupRetentionPeriod: 0        # Disable automated backups for sandbox
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-postgres'
+
+Outputs:
+  RDSEndpoint:
+    Description: PostgreSQL endpoint hostname
+    Value: !GetAtt RDSPostgresInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-endpoint'
+
+  RDSPort:
+    Description: PostgreSQL port
+    Value: !GetAtt RDSPostgresInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-port'
+
+  PSQLConnectCommand:
+    Description: psql connection command
+    Value: !Sub 'psql -h ${RDSPostgresInstance.Endpoint.Address} -U ${DBUsername} -d ${DBName} -p 5432'
+
+  JDBCConnectionString:
+    Description: JDBC connection string (Java / Spring Boot)
+    Value: !Sub 'jdbc:postgresql://${RDSPostgresInstance.Endpoint.Address}:5432/${DBName}'

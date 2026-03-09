@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EC2 only (t3.medium, 30 GB gp3).
+  Deploy in us-east-1 or us-west-2 only.
+
+# ---------------------------------------------------------------
+# Sandbox Limits:
+#   EC2: t2/t3/t3a/t4g micro|small|medium | max 100 GB | default tenancy
+# ---------------------------------------------------------------
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: EC2
+        Parameters:
+          - KeyPairName
+          - EC2InstanceType
+          - VolumeSize
+    ParameterLabels:
+      VpcId:
+        default: Default VPC ID
+      SubnetId:
+        default: Subnet (from your default VPC)
+      KeyPairName:
+        default: EC2 Key Pair
+      EC2InstanceType:
+        default: Instance Type
+      VolumeSize:
+        default: Root Volume Size (GB)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select your default VPC.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select a subnet from your default VPC.
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access.
+
+  EC2InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3a.micro
+      - t3a.small
+      - t3a.medium
+    Description: Allowed: t2/t3/t3a/t4g micro|small|medium only.
+
+  VolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 8
+    MaxValue: 100
+    Description: Root EBS volume size in GB (max 100 GB).
+
+Resources:
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH (22) and HTTP (80) inbound
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: SSH
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - Description: HTTP
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ec2-sg'
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref EC2InstanceType
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      KeyName: !Ref KeyPairName
+      Tenancy: default
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y httpd
+          systemctl enable httpd
+          systemctl start httpd
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+          AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/placement/availability-zone)
+          cat > /var/www/html/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head><title>EC2 Practice</title></head>
+          <body>
+            <h1>EC2 Practice Instance</h1>
+            <p><strong>Instance ID:</strong> ${INSTANCE_ID}</p>
+            <p><strong>Availability Zone:</strong> ${AZ}</p>
+          </body>
+          </html>
+          EOF
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ec2'
+
+Outputs:
+  EC2InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+
+  EC2PublicIP:
+    Description: EC2 Public IP
+    Value: !GetAtt EC2Instance.PublicIp
+
+  SSHCommand:
+    Description: SSH command
+    Value: !Sub 'ssh -i ps-ec2-key.pem ec2-user@${EC2Instance.PublicIp}'
+
+  HTTPUrl:
+    Description: HTTP URL
+    Value: !Sub 'http://${EC2Instance.PublicIp}'
