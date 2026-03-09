@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EKS Cluster with IAM roles and security group using Default VPC.
+  Mirrors eks-cluster.tf configuration.
+  Default VPC and subnets are auto-detected at deploy time.
+
+# ---------------------------------------------------------------
+# Terraform source: eks-cluster.tf
+#   - EKS Cluster IAM Role (AmazonEKSClusterPolicy + AmazonEKSVPCResourceController)
+#   - Cluster Security Group (all egress open)
+#   - EKS Cluster (private + public endpoint, no self-managed addon bootstrap)
+#   - Tags: Name, Environment, Application=HRMS
+# ---------------------------------------------------------------
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: EKS Cluster
+        Parameters:
+          - ClusterName
+          - ClusterVersion
+          - Environment
+    ParameterLabels:
+      ClusterName:
+        default: Cluster Name
+      ClusterVersion:
+        default: Kubernetes Version
+      Environment:
+        default: Environment Tag
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: my-eks-cluster
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9\-]*'
+    Description: Name of the EKS cluster (maps to var.cluster_name).
+
+  ClusterVersion:
+    Type: String
+    Default: '1.31'
+    AllowedValues:
+      - '1.29'
+      - '1.30'
+      - '1.31'
+    Description: Kubernetes version for the EKS cluster (maps to var.cluster_version).
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment tag value (maps to var.environment).
+
+Resources:
+
+  # ---------------------------------------------------------------
+  # Default VPC Lookup (Lambda Custom Resource)
+  # Queries AWS at deploy time for the default VPC and its subnets.
+  # ---------------------------------------------------------------
+
+  DefaultVpcLookupPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allows Lambda to describe VPCs and subnets for default VPC lookup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeVpcs
+              - ec2:DescribeSubnets
+            Resource: '*'
+
+  DefaultVpcLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref DefaultVpcLookupPolicy
+
+  DefaultVpcLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-vpc-lookup'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DefaultVpcLookupRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import hashlib
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  suffix = hashlib.md5(event['StackId'].encode()).hexdigest()[:8]
+                  ec2 = boto3.client('ec2')
+                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                  vpc_id = vpcs['Vpcs'][0]['VpcId']
+                  subnets = ec2.describe_subnets(Filters=[
+                      {'Name': 'vpc-id', 'Values': [vpc_id]},
+                      {'Name': 'defaultForAz', 'Values': ['true']}
+                  ])
+                  subnet_ids = sorted([s['SubnetId'] for s in subnets['Subnets']])
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'VpcId': vpc_id,
+                      'SubnetIds': ','.join(subnet_ids),
+                      'Suffix': suffix
+                  })
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  DefaultVpcLookup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DefaultVpcLookupFunction.Arn
+
+  # ---------------------------------------------------------------
+  # EKS Cluster IAM Role
+  # Terraform: aws_iam_role.eks_cluster
+  # ---------------------------------------------------------------
+
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSVPCResourceController
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------
+  # EKS Cluster Security Group
+  # Terraform: aws_security_group.eks_cluster
+  # ---------------------------------------------------------------
+
+  EKSClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ClusterName}-cluster-sg'
+      GroupDescription: Security group for EKS cluster
+      VpcId: !GetAtt DefaultVpcLookup.VpcId
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: '-1'
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------
+  # EKS Cluster
+  # Terraform: aws_eks_cluster.main
+  #   - endpoint_private_access = true
+  #   - endpoint_public_access  = true
+  #   - bootstrap_self_managed_addons = false
+  #   - subnets: private + public (all default VPC subnets used here)
+  # ---------------------------------------------------------------
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      Version: !Ref ClusterVersion
+      BootstrapSelfManagedAddons: false
+      ResourcesVpcConfig:
+        SubnetIds: !Split [',', !GetAtt DefaultVpcLookup.SubnetIds]
+        SecurityGroupIds:
+          - !Ref EKSClusterSecurityGroup
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: true
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: HRMS
+
+# ---------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------
+
+Outputs:
+
+  ClusterName:
+    Description: EKS cluster name
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-cluster-name'
+
+  ClusterArn:
+    Description: EKS cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-cluster-arn'
+
+  ClusterEndpoint:
+    Description: EKS cluster API server endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-cluster-endpoint'
+
+  ClusterCertificateAuthority:
+    Description: Certificate authority data for kubectl configuration
+    Value: !GetAtt EKSCluster.CertificateAuthorityData
+
+  ClusterRoleArn:
+    Description: IAM role ARN used by the EKS cluster
+    Value: !GetAtt EKSClusterRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-cluster-role-arn'
+
+  KubeconfigCommand:
+    Description: AWS CLI command to update kubeconfig
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'

@@ -71,7 +71,6 @@ Parameters:
 
   DBPassword:
     Type: String
-    Default: Admin1234!
     NoEcho: true
     MinLength: 8
     MaxLength: 64
@@ -98,7 +97,6 @@ Parameters:
 
   PGPassword:
     Type: String
-    Default: Admin1234!
     NoEcho: true
     MinLength: 8
     MaxLength: 41

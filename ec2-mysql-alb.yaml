@@ -48,7 +48,7 @@ Parameters:
 
   EC2InstanceType:
     Type: String
-    Default: t3.micro
+    Default: t3.medium
     AllowedValues:
       - t2.micro
       - t2.small
@@ -63,7 +63,7 @@ Parameters:
 
   DBInstanceClass:
     Type: String
-    Default: db.t3.micro
+    Default: db.t3.medium
     AllowedValues:
       - db.t3.micro
       - db.t3.small
@@ -91,7 +91,6 @@ Parameters:
 
   DBPassword:
     Type: String
-    Default: Admin1234!
     NoEcho: true
     MinLength: 8
     MaxLength: 41

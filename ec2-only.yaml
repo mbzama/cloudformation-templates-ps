@@ -1,7 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  EC2 only (t3.medium, 30 GB gp3).
-  Deploy in us-east-1 or us-west-2 only.
+  EC2 only (t3.medium, 30 GB gp3) using Default VPC.
+
+  Deploy in us-east-1 only. Subnets auto-detected for us-east-1a / us-east-1b.
+  Connect via EC2 Instance Connect (no key pair required).
 
 # ---------------------------------------------------------------
 # Sandbox Limits:
@@ -12,41 +14,17 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
-          default: Network
-        Parameters:
-          - VpcId
-          - SubnetId
-      - Label:
           default: EC2
         Parameters:
-          - KeyPairName
           - EC2InstanceType
           - VolumeSize
     ParameterLabels:
-      VpcId:
-        default: Default VPC ID
-      SubnetId:
-        default: Subnet (from your default VPC)
-      KeyPairName:
-        default: EC2 Key Pair
       EC2InstanceType:
         default: Instance Type
       VolumeSize:
         default: Root Volume Size (GB)
 
 Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: Select your default VPC.
-
-  SubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Description: Select a subnet from your default VPC.
-
-  KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 Key Pair for SSH access.
-
   EC2InstanceType:
     Type: String
     Default: t3.medium
@@ -60,24 +38,109 @@ Parameters:
       - t3a.micro
       - t3a.small
       - t3a.medium
-    Description: Allowed: t2/t3/t3a/t4g micro|small|medium only.
+    Description: "Allowed: t2/t3/t3a micro|small|medium only."
 
   VolumeSize:
     Type: Number
     Default: 30
     MinValue: 8
-    MaxValue: 100
-    Description: Root EBS volume size in GB (max 100 GB).
+    MaxValue: 30
+    Description: Root EBS volume size in GB (max 30 GB).
 
 Resources:
+
+  # ---------------------------------------------------------------
+  # Default VPC Lookup (Lambda Custom Resource)
+  # Filters subnets to us-east-1a and us-east-1b only.
+  # ---------------------------------------------------------------
+
+  DefaultVpcLookupPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allows Lambda to describe VPCs and subnets for default VPC lookup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeVpcs
+              - ec2:DescribeSubnets
+            Resource: '*'
+
+  DefaultVpcLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref DefaultVpcLookupPolicy
+
+  DefaultVpcLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-vpc-lookup'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DefaultVpcLookupRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import hashlib
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  suffix = hashlib.md5(event['StackId'].encode()).hexdigest()[:8]
+                  ec2 = boto3.client('ec2')
+                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                  vpc_id = vpcs['Vpcs'][0]['VpcId']
+                  subnets = ec2.describe_subnets(Filters=[
+                      {'Name': 'vpc-id', 'Values': [vpc_id]},
+                      {'Name': 'defaultForAz', 'Values': ['true']}
+                  ])
+                  allowed_azs = {'us-east-1a', 'us-east-1b'}
+                  subnet_list = sorted(
+                      [s for s in subnets['Subnets'] if s['AvailabilityZone'] in allowed_azs],
+                      key=lambda s: s['AvailabilityZone']
+                  )
+                  if not subnet_list:
+                      raise ValueError('No default subnets found in us-east-1a or us-east-1b')
+                  subnet_ids = [s['SubnetId'] for s in subnet_list]
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'VpcId': vpc_id,
+                      'SubnetId0': subnet_ids[0],
+                      'Suffix': suffix
+                  })
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  DefaultVpcLookup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DefaultVpcLookupFunction.Arn
+
+  # ---------------------------------------------------------------
+  # Security Group
+  # Port 22 required for EC2 Instance Connect (AWS pushes a temp key over SSH)
+  # ---------------------------------------------------------------
 
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow SSH (22) and HTTP (80) inbound
-      VpcId: !Ref VpcId
+      GroupDescription: Allow SSH (22) for EC2 Instance Connect and HTTP (80)
+      VpcId: !GetAtt DefaultVpcLookup.VpcId
       SecurityGroupIngress:
-        - Description: SSH
+        - Description: SSH for EC2 Instance Connect
           IpProtocol: tcp
           FromPort: 22
           ToPort: 22
@@ -91,16 +154,21 @@ Resources:
         - Key: Name
           Value: !Sub '${AWS::StackName}-ec2-sg'
 
+  # ---------------------------------------------------------------
+  # EC2 Instance
+  # No key pair — connect via EC2 Instance Connect from the AWS Console.
+  # ec2-instance-connect is pre-installed on Amazon Linux 2023.
+  # ---------------------------------------------------------------
+
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref EC2InstanceType
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
-      KeyName: !Ref KeyPairName
       Tenancy: default
       SecurityGroupIds:
         - !Ref EC2SecurityGroup
-      SubnetId: !Ref SubnetId
+      SubnetId: !GetAtt DefaultVpcLookup.SubnetId0
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
@@ -133,20 +201,33 @@ Resources:
           EOF
       Tags:
         - Key: Name
-          Value: !Sub '${AWS::StackName}-ec2'
+          Value: !Sub 'ec2-${DefaultVpcLookup.Suffix}'
+
+# ---------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------
 
 Outputs:
+
+  DefaultVpcId:
+    Description: Auto-detected default VPC ID
+    Value: !GetAtt DefaultVpcLookup.VpcId
+
   EC2InstanceId:
     Description: EC2 Instance ID
     Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-ec2-id'
 
   EC2PublicIP:
     Description: EC2 Public IP
     Value: !GetAtt EC2Instance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-ec2-ip'
 
-  SSHCommand:
-    Description: SSH command
-    Value: !Sub 'ssh -i ps-ec2-key.pem ec2-user@${EC2Instance.PublicIp}'
+  EC2ConnectURL:
+    Description: EC2 Instance Connect - open in AWS Console
+    Value: !Sub 'https://console.aws.amazon.com/ec2/v2/home?region=${AWS::Region}#Instances:instanceId=${EC2Instance}'
 
   HTTPUrl:
     Description: HTTP URL
